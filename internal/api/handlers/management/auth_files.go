@@ -578,7 +578,27 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
 	}
+	if quota := codexQuotaEntry(auth); quota != nil {
+		entry["codex_quota"] = quota
+	}
 	return entry
+}
+
+// codexQuotaEntry returns the most recent Codex usage snapshot captured for the
+// credential, or nil for non-codex auths (and codex auths that have not served
+// traffic since the passive collector shipped). The value is the generic map
+// stored under Metadata["codex_quota"], ready to be JSON-encoded as-is.
+func codexQuotaEntry(auth *coreauth.Auth) any {
+	if auth == nil || auth.Metadata == nil {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return nil
+	}
+	if raw, ok := auth.Metadata["codex_quota"]; ok && raw != nil {
+		return raw
+	}
+	return nil
 }
 
 func authWebsocketsValue(auth *coreauth.Auth) (bool, bool) {

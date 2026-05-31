@@ -3680,6 +3680,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
 		auth.recordRecentRequest(now, result.Success)
+		// Passive codex quota capture. The executor records the upstream
+		// response headers into ctx *before* it inspects the status code, so
+		// both 2xx and 429 responses carry the x-codex-* family here. We run on
+		// every result (not just success): a success refreshes used-percent,
+		// while a 429 additionally carries the reset timers that success
+		// responses omit. Non-codex / header-less results are no-ops.
+		applyCodexQuotaFromContext(ctx, auth, result.Provider)
 		if result.Success {
 			auth.Success++
 		} else {
