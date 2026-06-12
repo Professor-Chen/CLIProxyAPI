@@ -56,3 +56,14 @@ _bmad-output/*
 .DS_Store
 ._*
 .gocache/
+
+# Local runtime secrets & scratch — real credentials, never commit
+*.env
+.cpa-mgmt.env
+.api_key.txt
+*.api_key.txt
+.upgrade-rollback.txt
+config.yaml.bak-*
+auths.dead/
+quota-prober/
+test-images/
