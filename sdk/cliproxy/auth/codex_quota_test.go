@@ -213,3 +213,71 @@ func TestApplyCodexQuotaFromContext_NoHeadersLeavesMetadataUntouched(t *testing.
 		t.Errorf("no quota headers should not write metadata, got %+v", a.Metadata)
 	}
 }
+
+// Regression: a token refresh clones the credential before refreshing and then
+// calls Manager.Update with that stale clone. If quota capture (passive or the
+// probe endpoint) wrote a fresh codex_quota in the meantime, Update must not
+// clobber it with the older Metadata that lacks the key.
+func TestManagerUpdate_PreservesCodexQuotaAgainstStaleRefresh(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+
+	live := &Auth{ID: "codex-a.json", Provider: codexProviderKey, Metadata: map[string]any{"email": "a@example.com"}}
+	h := http.Header{}
+	h.Set("x-codex-primary-used-percent", "12.5")
+	h.Set("x-codex-primary-reset-at", "1900000000")
+	if !ApplyCodexQuotaSnapshot(live, ParseCodexQuotaHeaders(h)) {
+		t.Fatal("failed to seed codex_quota snapshot")
+	}
+	if _, err := manager.Register(ctx, live); err != nil {
+		t.Fatalf("Register error: %v", err)
+	}
+
+	// The stale clone predates the quota capture: it has the refreshed token
+	// but no codex_quota.
+	stale := &Auth{ID: "codex-a.json", Provider: codexProviderKey, Metadata: map[string]any{"email": "a@example.com", "access_token": "refreshed-token"}}
+	if _, err := manager.Update(ctx, stale); err != nil {
+		t.Fatalf("Update error: %v", err)
+	}
+
+	got, ok := manager.GetByID("codex-a.json")
+	if !ok {
+		t.Fatal("auth missing after update")
+	}
+	if _, ok := got.Metadata[codexQuotaMetadataKey].(map[string]any); !ok {
+		t.Fatalf("codex_quota was clobbered by stale refresh Update: %+v", got.Metadata)
+	}
+	if got.Metadata["access_token"] != "refreshed-token" {
+		t.Errorf("refresh field should still apply, got %+v", got.Metadata)
+	}
+}
+
+// A fresher snapshot carried by the incoming update must win over the one
+// already stored (it is the more recent write).
+func TestManagerUpdate_IncomingCodexQuotaWins(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+
+	live := &Auth{ID: "codex-b.json", Provider: codexProviderKey, Metadata: map[string]any{}}
+	hOld := http.Header{}
+	hOld.Set("x-codex-primary-used-percent", "10")
+	ApplyCodexQuotaSnapshot(live, ParseCodexQuotaHeaders(hOld))
+	if _, err := manager.Register(ctx, live); err != nil {
+		t.Fatalf("Register error: %v", err)
+	}
+
+	incoming := &Auth{ID: "codex-b.json", Provider: codexProviderKey, Metadata: map[string]any{}}
+	hNew := http.Header{}
+	hNew.Set("x-codex-primary-used-percent", "88")
+	ApplyCodexQuotaSnapshot(incoming, ParseCodexQuotaHeaders(hNew))
+	if _, err := manager.Update(ctx, incoming); err != nil {
+		t.Fatalf("Update error: %v", err)
+	}
+
+	got, _ := manager.GetByID("codex-b.json")
+	quota, _ := got.Metadata[codexQuotaMetadataKey].(map[string]any)
+	primary, _ := quota["primary"].(map[string]any)
+	if primary["used_percent"] != 88.0 {
+		t.Errorf("incoming snapshot should win, got used_percent=%v", primary["used_percent"])
+	}
+}

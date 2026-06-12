@@ -153,6 +153,34 @@ func ApplyCodexQuotaSnapshot(auth *Auth, snapshot *CodexQuotaSnapshot) bool {
 	return true
 }
 
+// preserveCodexQuotaMetadata carries an existing codex_quota snapshot forward
+// onto an incoming auth that lacks one. Manager.Update rebuilds the credential
+// from the caller's snapshot, and token refresh in particular clones a
+// credential *before* refreshing and then calls Update with that stale clone.
+// Without this, a refresh racing with quota capture (passive MarkResult or the
+// active probe endpoint) would overwrite a freshly stored codex_quota with an
+// older Metadata map that no longer contains it. When the incoming auth already
+// carries a codex_quota entry it wins, since it is the more recent write.
+// Callers must hold the manager lock (it reads the existing credential).
+func preserveCodexQuotaMetadata(incoming, existing *Auth) {
+	if incoming == nil || existing == nil || len(existing.Metadata) == 0 {
+		return
+	}
+	existingQuota, ok := existing.Metadata[codexQuotaMetadataKey]
+	if !ok || existingQuota == nil {
+		return
+	}
+	if incoming.Metadata != nil {
+		if current, exists := incoming.Metadata[codexQuotaMetadataKey]; exists && current != nil {
+			return
+		}
+	}
+	if incoming.Metadata == nil {
+		incoming.Metadata = make(map[string]any)
+	}
+	incoming.Metadata[codexQuotaMetadataKey] = existingQuota
+}
+
 // applyCodexQuotaFromContext is the passive collector. MarkResult calls this on
 // every codex execution result (success or failure) with the same context the
 // executor used; the executor stashes the upstream response headers via

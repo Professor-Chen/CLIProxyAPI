@@ -2196,6 +2196,12 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 			auth.ModelStates = existing.ModelStates
 		}
 	}
+	// Carry the passively/actively captured Codex quota forward when the
+	// incoming update was built from a stale snapshot (e.g. token refresh,
+	// which clones the credential before refreshing). Mirrors the
+	// Success/Failed/recentRequests carry-over above so a refresh cannot
+	// clobber a freshly stored codex_quota.
+	preserveCodexQuotaMetadata(auth, existing)
 	now := time.Now()
 	clearedCooldown := false
 	if m.cooldownDisabledForAuth(auth) || auth.Disabled || auth.Status == StatusDisabled {

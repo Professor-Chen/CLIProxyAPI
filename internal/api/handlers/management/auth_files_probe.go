@@ -274,12 +274,21 @@ func categorizeProbeStatus(code int, message string) string {
 	}
 }
 
-// isProbeBanMessage reports whether an upstream error body looks like an account
-// ban/deactivation rather than a recoverable auth error.
+// isProbeBanMessage reports whether an upstream 403 body looks like an
+// account-level ban/deactivation rather than a recoverable auth failure. We
+// deliberately do NOT match a bare "disabled": upstream 403s use that word for
+// recoverable feature/model disablement (e.g. "image generation is disabled
+// for this account"), which is not a ban. "disabled" only counts when it
+// clearly targets the account itself.
 func isProbeBanMessage(message string) bool {
 	lower := strings.ToLower(message)
-	for _, marker := range []string{"deactivated", "banned", "suspended", "disabled", "terminated"} {
+	for _, marker := range []string{"deactivated", "suspended", "banned", "terminated"} {
 		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	for _, phrase := range []string{"account disabled", "account is disabled", "account was disabled", "account has been disabled"} {
+		if strings.Contains(lower, phrase) {
 			return true
 		}
 	}
