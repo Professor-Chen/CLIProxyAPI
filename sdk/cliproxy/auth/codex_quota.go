@@ -135,6 +135,24 @@ func (w *CodexQuotaWindow) toMetadata() map[string]any {
 	return out
 }
 
+// ApplyCodexQuotaSnapshot persists a parsed Codex quota snapshot onto the
+// credential's Metadata under the shared codex_quota key. Passive capture
+// (MarkResult, via applyCodexQuotaFromContext) and the active probe management
+// endpoint both funnel through here so they converge on identical storage and
+// the auth-files API exposes one shape regardless of how the snapshot was
+// obtained. Nil auth or nil snapshot are no-ops; the boolean reports whether
+// anything was written so callers can decide whether to persist the auth.
+func ApplyCodexQuotaSnapshot(auth *Auth, snapshot *CodexQuotaSnapshot) bool {
+	if auth == nil || snapshot == nil {
+		return false
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata[codexQuotaMetadataKey] = snapshot.ToMetadata()
+	return true
+}
+
 // applyCodexQuotaFromContext is the passive collector. MarkResult calls this on
 // every codex execution result (success or failure) with the same context the
 // executor used; the executor stashes the upstream response headers via
@@ -152,8 +170,5 @@ func applyCodexQuotaFromContext(ctx context.Context, auth *Auth, provider string
 	if snapshot == nil {
 		return
 	}
-	if auth.Metadata == nil {
-		auth.Metadata = make(map[string]any)
-	}
-	auth.Metadata[codexQuotaMetadataKey] = snapshot.ToMetadata()
+	ApplyCodexQuotaSnapshot(auth, snapshot)
 }
