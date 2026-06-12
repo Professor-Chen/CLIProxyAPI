@@ -274,35 +274,54 @@ func categorizeProbeStatus(code int, message string) string {
 	}
 }
 
-// isProbeBanMessage reports whether an upstream 403 body looks like an
-// account-level ban/deactivation rather than a recoverable auth failure.
-// "deactivated"/"suspended"/"banned"/"terminated" are unambiguous account
-// verbs. "disabled" is ambiguous — upstream uses it both for account bans
-// ("we've disabled your account") and for recoverable feature/model
-// disablement ("image generation is disabled") — so it only counts as a ban
-// when it co-occurs with "account" AND is not qualified by a feature/model
-// term. Feature/model disablement is left to the recoverable auth_invalid
-// bucket.
+// banAccountPhrases are contiguous phrases that anchor "disabled" to the
+// account, covering both word orders. Anchoring on a phrase — instead of
+// testing whether "disabled" and "account" merely co-occur anywhere in the
+// body — is what keeps "image generation is disabled for this account" (a
+// recoverable feature disablement) out of the ban bucket while still catching
+// "account has been disabled for using model X" (a real ban that happens to
+// mention a model).
+var banAccountPhrases = []string{
+	"account has been disabled",
+	"account is disabled",
+	"account was disabled",
+	"account disabled",
+	"disabled your account",
+	"disabled this account",
+	"disabled the account",
+}
+
+// isProbeBanMessage classifies an upstream 403 body as an account ban using
+// ordered phrase anchoring; the steps are evaluated in order and the first
+// match wins:
+//
+//  1. Unambiguous account-ban verbs (deactivated/suspended/terminated/banned)
+//     win regardless of any feature/model wording elsewhere in the message.
+//  2. Account-anchored "disabled" phrases (banAccountPhrases). Because this
+//     runs before any feature/model check, a real ban such as "account has
+//     been disabled for using model X" is caught here and the trailing "model"
+//     cannot pull it into auth_invalid.
+//
+// Anything else — feature/model disablement ("this model is disabled") and
+// generic 403s — is not a ban; the caller routes it to the recoverable
+// auth_invalid bucket.
+//
+// This is a deliberately bounded single-probe heuristic: a maliciously phrased
+// body could still slip past these anchors. That is acceptable because the
+// new-api health classifier has a statistical fallback (sustained 401/403 with
+// zero successes over 24h -> banned) that self-heals any single-probe
+// banned<->auth_invalid misclassification. The edge is therefore non-fatal, and
+// we intentionally stop adding substring rules to chase ever-more-contrived
+// phrasings.
 func isProbeBanMessage(message string) bool {
 	lower := strings.ToLower(message)
-	for _, marker := range []string{"deactivated", "suspended", "banned", "terminated"} {
-		if strings.Contains(lower, marker) {
+	for _, verb := range []string{"deactivated", "suspended", "terminated", "banned"} {
+		if strings.Contains(lower, verb) {
 			return true
 		}
 	}
-	if strings.Contains(lower, "disabled") && strings.Contains(lower, "account") {
-		return !mentionsRecoverableFeature(lower)
-	}
-	return false
-}
-
-// mentionsRecoverableFeature reports whether a lower-cased error body refers to
-// a feature/model/tool being disabled rather than the account itself, so a
-// message like "image generation is disabled for this account" is not
-// misclassified as a ban.
-func mentionsRecoverableFeature(lower string) bool {
-	for _, term := range []string{"feature", "model", "image generation", "image-generation", "tool", "capability"} {
-		if strings.Contains(lower, term) {
+	for _, phrase := range banAccountPhrases {
+		if strings.Contains(lower, phrase) {
 			return true
 		}
 	}

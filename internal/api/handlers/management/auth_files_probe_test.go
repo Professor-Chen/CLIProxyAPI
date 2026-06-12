@@ -83,14 +83,25 @@ func TestClassifyProbeError(t *testing.T) {
 		{"429 rate limited", probeStatusErr{code: 429, msg: "upstream 429"}, 429, probeErrCategoryRateLimited},
 		{"401 auth invalid", probeStatusErr{code: 401, msg: "unauthorized"}, 401, probeErrCategoryAuthInvalid},
 		{"403 generic is auth invalid", probeStatusErr{code: 403, msg: "forbidden"}, 403, probeErrCategoryAuthInvalid},
-		{"403 deactivated is banned", probeStatusErr{code: 403, msg: "account_deactivated: your account was deactivated"}, 403, probeErrCategoryBanned},
-		{"403 account disabled is banned", probeStatusErr{code: 403, msg: "your account has been disabled"}, 403, probeErrCategoryBanned},
+
+		// banned — unambiguous account-ban verbs.
+		{"403 deactivated is banned", probeStatusErr{code: 403, msg: "your account has been deactivated"}, 403, probeErrCategoryBanned},
 		{"403 suspended is banned", probeStatusErr{code: 403, msg: "account suspended for abuse"}, 403, probeErrCategoryBanned},
+		{"403 terminated is banned", probeStatusErr{code: 403, msg: "account terminated"}, 403, probeErrCategoryBanned},
+
+		// banned — account-anchored "disabled" phrases (both word orders).
+		{"403 account has been disabled is banned", probeStatusErr{code: 403, msg: "your account has been disabled"}, 403, probeErrCategoryBanned},
 		{"403 disabled your account is banned", probeStatusErr{code: 403, msg: "we've disabled your account for a policy violation"}, 403, probeErrCategoryBanned},
 		{"403 disabled this account is banned", probeStatusErr{code: 403, msg: "we have disabled this account"}, 403, probeErrCategoryBanned},
-		{"403 feature disabled is auth invalid", probeStatusErr{code: 403, msg: "image generation is disabled for this account"}, 403, probeErrCategoryAuthInvalid},
+		// Round-3 regression anchor: a real account ban that mentions a model
+		// must stay banned and NOT be pulled into auth_invalid by "model".
+		{"403 account disabled mentioning model is banned", probeStatusErr{code: 403, msg: "account has been disabled for using model X"}, 403, probeErrCategoryBanned},
+
+		// auth_invalid — feature/model disablement, not the account itself.
+		{"403 image generation disabled is auth invalid", probeStatusErr{code: 403, msg: "image generation is disabled for this account"}, 403, probeErrCategoryAuthInvalid},
 		{"403 model disabled is auth invalid", probeStatusErr{code: 403, msg: "this model is disabled"}, 403, probeErrCategoryAuthInvalid},
 		{"403 model disabled for account is auth invalid", probeStatusErr{code: 403, msg: "this model is disabled for your account"}, 403, probeErrCategoryAuthInvalid},
+
 		{"500 upstream", probeStatusErr{code: 500, msg: "boom"}, 500, probeErrCategoryUpstream},
 		{"408 stream disconnect is upstream", probeStatusErr{code: 408, msg: "stream disconnected"}, 408, probeErrCategoryUpstream},
 		{"plain error is network", errPlainNetwork{}, 0, probeErrCategoryNetwork},
