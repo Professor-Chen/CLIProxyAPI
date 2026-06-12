@@ -222,7 +222,7 @@ func TestManagerUpdate_PreservesCodexQuotaAgainstStaleRefresh(t *testing.T) {
 	manager := NewManager(nil, nil, nil)
 	ctx := context.Background()
 
-	live := &Auth{ID: "codex-a.json", Provider: codexProviderKey, Metadata: map[string]any{"email": "a@example.com"}}
+	live := &Auth{ID: "codex-a.json", Provider: codexProviderKey, Metadata: map[string]any{"account_id": "acct-A", "email": "a@example.com"}}
 	h := http.Header{}
 	h.Set("x-codex-primary-used-percent", "12.5")
 	h.Set("x-codex-primary-reset-at", "1900000000")
@@ -233,9 +233,9 @@ func TestManagerUpdate_PreservesCodexQuotaAgainstStaleRefresh(t *testing.T) {
 		t.Fatalf("Register error: %v", err)
 	}
 
-	// The stale clone predates the quota capture: it has the refreshed token
-	// but no codex_quota.
-	stale := &Auth{ID: "codex-a.json", Provider: codexProviderKey, Metadata: map[string]any{"email": "a@example.com", "access_token": "refreshed-token"}}
+	// The stale clone predates the quota capture: same account (account_id/email
+	// unchanged by a token refresh), refreshed token, but no codex_quota.
+	stale := &Auth{ID: "codex-a.json", Provider: codexProviderKey, Metadata: map[string]any{"account_id": "acct-A", "email": "a@example.com", "access_token": "refreshed-token"}}
 	if _, err := manager.Update(ctx, stale); err != nil {
 		t.Fatalf("Update error: %v", err)
 	}
@@ -279,5 +279,57 @@ func TestManagerUpdate_IncomingCodexQuotaWins(t *testing.T) {
 	primary, _ := quota["primary"].(map[string]any)
 	if primary["used_percent"] != 88.0 {
 		t.Errorf("incoming snapshot should win, got used_percent=%v", primary["used_percent"])
+	}
+}
+
+// Regression for the cross-account leak: replacing the on-disk credential at a
+// path with a DIFFERENT account's export (watcher reload = credential swap)
+// must NOT carry the previous account's quota onto the new account.
+func TestManagerUpdate_DoesNotCarryQuotaAcrossAccountSwap(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+
+	accountA := &Auth{ID: "codex-slot.json", Provider: codexProviderKey, Metadata: map[string]any{"account_id": "acct-A", "email": "a@example.com"}}
+	h := http.Header{}
+	h.Set("x-codex-primary-used-percent", "42")
+	ApplyCodexQuotaSnapshot(accountA, ParseCodexQuotaHeaders(h))
+	if _, err := manager.Register(ctx, accountA); err != nil {
+		t.Fatalf("Register error: %v", err)
+	}
+
+	// Same path, different account, and the new export carries no quota.
+	accountB := &Auth{ID: "codex-slot.json", Provider: codexProviderKey, Metadata: map[string]any{"account_id": "acct-B", "email": "b@example.com"}}
+	if _, err := manager.Update(ctx, accountB); err != nil {
+		t.Fatalf("Update error: %v", err)
+	}
+
+	got, _ := manager.GetByID("codex-slot.json")
+	if _, ok := got.Metadata[codexQuotaMetadataKey]; ok {
+		t.Fatalf("account A's quota must not be carried onto account B: %+v", got.Metadata)
+	}
+}
+
+// A same-account reload that lacks a fresh codex_quota (e.g. an unrelated field
+// edit re-read from disk) must still keep the captured quota.
+func TestManagerUpdate_PreservesQuotaOnSameAccountReload(t *testing.T) {
+	manager := NewManager(nil, nil, nil)
+	ctx := context.Background()
+
+	account := &Auth{ID: "codex-slot2.json", Provider: codexProviderKey, Metadata: map[string]any{"account_id": "acct-C", "email": "c@example.com"}}
+	h := http.Header{}
+	h.Set("x-codex-primary-used-percent", "7")
+	ApplyCodexQuotaSnapshot(account, ParseCodexQuotaHeaders(h))
+	if _, err := manager.Register(ctx, account); err != nil {
+		t.Fatalf("Register error: %v", err)
+	}
+
+	reloaded := &Auth{ID: "codex-slot2.json", Provider: codexProviderKey, Metadata: map[string]any{"account_id": "acct-C", "email": "c@example.com", "priority": 5}}
+	if _, err := manager.Update(ctx, reloaded); err != nil {
+		t.Fatalf("Update error: %v", err)
+	}
+
+	got, _ := manager.GetByID("codex-slot2.json")
+	if _, ok := got.Metadata[codexQuotaMetadataKey]; !ok {
+		t.Fatalf("same-account reload should keep codex_quota: %+v", got.Metadata)
 	}
 }

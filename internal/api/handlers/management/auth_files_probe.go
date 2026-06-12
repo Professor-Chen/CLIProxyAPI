@@ -275,11 +275,14 @@ func categorizeProbeStatus(code int, message string) string {
 }
 
 // isProbeBanMessage reports whether an upstream 403 body looks like an
-// account-level ban/deactivation rather than a recoverable auth failure. We
-// deliberately do NOT match a bare "disabled": upstream 403s use that word for
-// recoverable feature/model disablement (e.g. "image generation is disabled
-// for this account"), which is not a ban. "disabled" only counts when it
-// clearly targets the account itself.
+// account-level ban/deactivation rather than a recoverable auth failure.
+// "deactivated"/"suspended"/"banned"/"terminated" are unambiguous account
+// verbs. "disabled" is ambiguous — upstream uses it both for account bans
+// ("we've disabled your account") and for recoverable feature/model
+// disablement ("image generation is disabled") — so it only counts as a ban
+// when it co-occurs with "account" AND is not qualified by a feature/model
+// term. Feature/model disablement is left to the recoverable auth_invalid
+// bucket.
 func isProbeBanMessage(message string) bool {
 	lower := strings.ToLower(message)
 	for _, marker := range []string{"deactivated", "suspended", "banned", "terminated"} {
@@ -287,8 +290,19 @@ func isProbeBanMessage(message string) bool {
 			return true
 		}
 	}
-	for _, phrase := range []string{"account disabled", "account is disabled", "account was disabled", "account has been disabled"} {
-		if strings.Contains(lower, phrase) {
+	if strings.Contains(lower, "disabled") && strings.Contains(lower, "account") {
+		return !mentionsRecoverableFeature(lower)
+	}
+	return false
+}
+
+// mentionsRecoverableFeature reports whether a lower-cased error body refers to
+// a feature/model/tool being disabled rather than the account itself, so a
+// message like "image generation is disabled for this account" is not
+// misclassified as a ban.
+func mentionsRecoverableFeature(lower string) bool {
+	for _, term := range []string{"feature", "model", "image generation", "image-generation", "tool", "capability"} {
+		if strings.Contains(lower, term) {
 			return true
 		}
 	}

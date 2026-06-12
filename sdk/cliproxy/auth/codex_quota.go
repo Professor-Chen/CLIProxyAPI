@@ -153,15 +153,60 @@ func ApplyCodexQuotaSnapshot(auth *Auth, snapshot *CodexQuotaSnapshot) bool {
 	return true
 }
 
+// codexMetadataString returns a trimmed string value from the credential's
+// Metadata, or "" when the key is absent or not a string.
+func codexMetadataString(auth *Auth, key string) string {
+	if auth == nil || auth.Metadata == nil {
+		return ""
+	}
+	if v, ok := auth.Metadata[key].(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+// sameCodexAccount reports whether two codex credentials belong to the same
+// account. It compares the stable identity fields that survive a token refresh
+// and are present in the on-disk JSON (so a watcher reload carries them too):
+// account_id (the OpenAI account id) preferred, with email as a secondary
+// signal. It returns true only when at least one identity field is present on
+// both sides and every field present on both sides agrees, and false when no
+// shared identity field exists — so callers err on the side of NOT carrying
+// state across a credential swap.
+func sameCodexAccount(incoming, existing *Auth) bool {
+	if incoming == nil || existing == nil {
+		return false
+	}
+	matched := false
+	for _, key := range []string{"account_id", "email"} {
+		a := codexMetadataString(incoming, key)
+		b := codexMetadataString(existing, key)
+		if a == "" || b == "" {
+			continue
+		}
+		if !strings.EqualFold(a, b) {
+			return false
+		}
+		matched = true
+	}
+	return matched
+}
+
 // preserveCodexQuotaMetadata carries an existing codex_quota snapshot forward
-// onto an incoming auth that lacks one. Manager.Update rebuilds the credential
-// from the caller's snapshot, and token refresh in particular clones a
-// credential *before* refreshing and then calls Update with that stale clone.
-// Without this, a refresh racing with quota capture (passive MarkResult or the
-// active probe endpoint) would overwrite a freshly stored codex_quota with an
-// older Metadata map that no longer contains it. When the incoming auth already
-// carries a codex_quota entry it wins, since it is the more recent write.
-// Callers must hold the manager lock (it reads the existing credential).
+// onto an incoming auth that lacks one, but ONLY when both refer to the same
+// account. Manager.Update runs on every credential change, not just token
+// refresh. A token refresh clones the credential *before* refreshing and then
+// calls Update with that stale clone, so the just-captured codex_quota must be
+// preserved for the same account. But a file-watcher reload that replaces the
+// on-disk JSON with a different account's export (a credential swap on the same
+// path) also reaches Update — and there, carrying the previous account's quota
+// would mis-attribute one account's limits to another and drive wrong
+// limited/degraded health classification until traffic overwrites it. We
+// therefore gate preservation on sameCodexAccount: same account keeps the
+// snapshot (fixing the refresh race); a different or unknown account drops it
+// and starts from empty (it refills on the next request/probe). An incoming
+// snapshot always wins, as it is the more recent write. Callers must hold the
+// manager lock (it reads the existing credential).
 func preserveCodexQuotaMetadata(incoming, existing *Auth) {
 	if incoming == nil || existing == nil || len(existing.Metadata) == 0 {
 		return
@@ -174,6 +219,9 @@ func preserveCodexQuotaMetadata(incoming, existing *Auth) {
 		if current, exists := incoming.Metadata[codexQuotaMetadataKey]; exists && current != nil {
 			return
 		}
+	}
+	if !sameCodexAccount(incoming, existing) {
+		return
 	}
 	if incoming.Metadata == nil {
 		incoming.Metadata = make(map[string]any)
