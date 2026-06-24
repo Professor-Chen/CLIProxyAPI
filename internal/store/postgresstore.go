@@ -15,6 +15,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	fileauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
@@ -221,8 +222,12 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
-			return "", err
+		changed, errSave := fileauth.SaveTokenStorageIfChanged(auth.Storage, path)
+		if errSave != nil {
+			return "", errSave
+		}
+		if !changed {
+			return path, nil
 		}
 	case auth.Metadata != nil:
 		auth.Metadata["disabled"] = auth.Disabled

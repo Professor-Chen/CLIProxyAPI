@@ -86,6 +86,7 @@ const (
 	refreshIneffectiveBackoff = 30 * time.Second
 	quotaBackoffBase          = time.Second
 	quotaBackoffMax           = 30 * time.Minute
+	codexQuotaPersistInterval = time.Minute
 	transientErrorCooldown    = time.Minute
 )
 
@@ -259,6 +260,8 @@ type Manager struct {
 	refreshCancel context.CancelFunc
 	refreshLoop   *authAutoRefreshLoop
 
+	codexQuotaPersistLast map[string]time.Time
+
 	requestPrepareLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent
 	// 401 recoveries and auto-refresh workers do not race the same refresh_token.
@@ -274,20 +277,42 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook = NoopHook{}
 	}
 	manager := &Manager{
-		store:            store,
-		executors:        make(map[string]ProviderExecutor),
-		selector:         selector,
-		hook:             hook,
-		auths:            make(map[string]*Auth),
-		homeRuntimeAuths: make(map[string]map[string]*Auth),
-		providerOffsets:  make(map[string]int),
-		modelPoolOffsets: make(map[string]int),
+		store:                 store,
+		executors:             make(map[string]ProviderExecutor),
+		selector:              selector,
+		hook:                  hook,
+		auths:                 make(map[string]*Auth),
+		homeRuntimeAuths:      make(map[string]map[string]*Auth),
+		providerOffsets:       make(map[string]int),
+		modelPoolOffsets:      make(map[string]int),
+		codexQuotaPersistLast: make(map[string]time.Time),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
 	return manager
+}
+
+func (m *Manager) shouldPersistCodexQuotaLocked(authID string, now time.Time) bool {
+	if m == nil {
+		return false
+	}
+	if strings.TrimSpace(authID) == "" {
+		return false
+	}
+	last, ok := m.codexQuotaPersistLast[authID]
+	return !ok || now.Sub(last) >= codexQuotaPersistInterval
+}
+
+func (m *Manager) markCodexQuotaPersistLocked(authID string, now time.Time) {
+	if m == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	if m.codexQuotaPersistLast == nil {
+		m.codexQuotaPersistLast = make(map[string]time.Time)
+	}
+	m.codexQuotaPersistLast[authID] = now
 }
 
 func (m *Manager) SetPluginScheduler(scheduler PluginScheduler) {
@@ -3686,13 +3711,21 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			cooldownRecordsBefore = m.cooldownStateRecordsForAuthLocked(auth, now)
 		}
 		auth.recordRecentRequest(now, result.Success)
+		shouldPersistAuth := !result.Success
 		// Passive codex quota capture. The executor records the upstream
 		// response headers into ctx *before* it inspects the status code, so
 		// both 2xx and 429 responses carry the x-codex-* family here. We run on
 		// every result (not just success): a success refreshes used-percent,
 		// while a 429 additionally carries the reset timers that success
 		// responses omit. Non-codex / header-less results are no-ops.
-		applyCodexQuotaFromContext(ctx, auth, result.Provider)
+		if snapshot := codexQuotaSnapshotFromContext(ctx, result.Provider); snapshot != nil {
+			if !result.Success || m.shouldPersistCodexQuotaLocked(auth.ID, now) {
+				if ApplyCodexQuotaSnapshot(auth, snapshot) {
+					m.markCodexQuotaPersistLocked(auth.ID, now)
+					shouldPersistAuth = true
+				}
+			}
+		}
 		if result.Success {
 			auth.Success++
 		} else {
@@ -3829,7 +3862,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
+		if shouldPersistAuth {
+			_ = m.persist(ctx, auth)
+		}
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
 			cooldownRecordsAfter := m.cooldownStateRecordsForAuthLocked(auth, now)

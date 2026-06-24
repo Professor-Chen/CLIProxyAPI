@@ -214,6 +214,54 @@ func TestApplyCodexQuotaFromContext_NoHeadersLeavesMetadataUntouched(t *testing.
 	}
 }
 
+func TestMarkResult_ThrottlesSuccessfulCodexQuotaPersistence(t *testing.T) {
+	store := &countingStore{}
+	manager := NewManager(store, nil, nil)
+	auth := &Auth{ID: "codex-throttle.json", Provider: codexProviderKey, Metadata: map[string]any{"type": "codex"}}
+	if _, err := manager.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register returned error: %v", err)
+	}
+
+	ctx := codexQuotaHeaderContext("12.5", http.StatusOK)
+	manager.MarkResult(ctx, Result{AuthID: auth.ID, Provider: codexProviderKey, Model: "gpt-5", Success: true})
+	if got := store.saveCount.Load(); got != 1 {
+		t.Fatalf("first successful quota capture Save calls = %d, want 1", got)
+	}
+
+	ctx = codexQuotaHeaderContext("13", http.StatusOK)
+	manager.MarkResult(ctx, Result{AuthID: auth.ID, Provider: codexProviderKey, Model: "gpt-5", Success: true})
+	if got := store.saveCount.Load(); got != 1 {
+		t.Fatalf("second successful quota capture inside throttle Save calls = %d, want 1", got)
+	}
+
+	manager.mu.Lock()
+	manager.codexQuotaPersistLast[auth.ID] = time.Now().Add(-(codexQuotaPersistInterval + time.Second))
+	manager.mu.Unlock()
+	ctx = codexQuotaHeaderContext("14", http.StatusOK)
+	manager.MarkResult(ctx, Result{AuthID: auth.ID, Provider: codexProviderKey, Model: "gpt-5", Success: true})
+	if got := store.saveCount.Load(); got != 2 {
+		t.Fatalf("successful quota capture after throttle Save calls = %d, want 2", got)
+	}
+
+	ctx = codexQuotaHeaderContext("100", http.StatusTooManyRequests)
+	manager.MarkResult(ctx, Result{AuthID: auth.ID, Provider: codexProviderKey, Model: "gpt-5", Success: false, Error: &Error{HTTPStatus: http.StatusTooManyRequests}})
+	if got := store.saveCount.Load(); got != 3 {
+		t.Fatalf("429 quota capture Save calls = %d, want 3", got)
+	}
+}
+
+func codexQuotaHeaderContext(usedPercent string, status int) context.Context {
+	ctx := logging.WithResponseHeadersHolder(context.Background())
+	h := http.Header{}
+	h.Set("x-codex-primary-used-percent", usedPercent)
+	h.Set("x-codex-primary-window-minutes", "300")
+	if status == http.StatusTooManyRequests {
+		h.Set("x-codex-primary-reset-after-seconds", "3600")
+	}
+	logging.SetResponseHeaders(ctx, h)
+	return ctx
+}
+
 // Regression: a token refresh clones the credential before refreshing and then
 // calls Manager.Update with that stale clone. If quota capture (passive or the
 // probe endpoint) wrote a fresh codex_quota in the meantime, Update must not

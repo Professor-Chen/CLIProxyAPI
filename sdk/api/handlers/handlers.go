@@ -994,7 +994,7 @@ func (h *BaseAPIHandler) streamWithPluginExecutor(ctx context.Context, entryProt
 
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	interceptorHost := h.interceptorHost()
-	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
+	streamInterceptorsActive := streamInterceptorsEnabled(h.Cfg, interceptorHost)
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
 	baseStreamHeaders := cloneHeader(streamResult.Headers)
 	upstreamHeaders := downstreamHeadersFromExecutor(rawStreamHeaders, passthroughHeadersEnabled)
@@ -1186,7 +1186,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 	}
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	interceptorHost := h.interceptorHost()
-	streamInterceptorsActive := streamInterceptorsEnabled(interceptorHost)
+	streamInterceptorsActive := streamInterceptorsEnabled(h.Cfg, interceptorHost)
 	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
 	// Keep a mutable map so bootstrap retries can replace it before first payload is sent.
 	rawStreamHeaders := cloneHeader(streamResult.Headers)
@@ -1920,8 +1920,11 @@ func (h *BaseAPIHandler) applyModelRouter(ctx context.Context, handlerType, mode
 	return decision
 }
 
-func streamInterceptorsEnabled(host PluginInterceptorHost) bool {
+func streamInterceptorsEnabled(cfg *config.SDKConfig, host PluginInterceptorHost) bool {
 	if host == nil {
+		return false
+	}
+	if cfg != nil && cfg.PluginStreamInterceptors != nil && !*cfg.PluginStreamInterceptors {
 		return false
 	}
 	if detector, ok := host.(streamInterceptorDetector); ok {

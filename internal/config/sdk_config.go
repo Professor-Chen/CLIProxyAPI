@@ -49,6 +49,11 @@ type SDKConfig struct {
 	// Default is false (disabled).
 	PassthroughHeaders bool `yaml:"passthrough-headers" json:"passthrough-headers"`
 
+	// PluginStreamInterceptors controls whether plugin stream chunk interceptors run for every streaming chunk.
+	// Nil defaults to enabled for backwards compatibility. Set false on high-throughput pools that do not
+	// need per-token stream rewriting.
+	PluginStreamInterceptors *bool `yaml:"plugin-stream-interceptors,omitempty" json:"plugin-stream-interceptors,omitempty"`
+
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
 

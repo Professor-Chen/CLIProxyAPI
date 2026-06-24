@@ -239,12 +239,15 @@ func preserveCodexQuotaMetadata(incoming, existing *Auth) {
 // quota headers and are silently skipped. Callers must hold the manager lock
 // (this only mutates the passed-in auth, which MarkResult then persists).
 func applyCodexQuotaFromContext(ctx context.Context, auth *Auth, provider string) {
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(provider), codexProviderKey) {
+	if auth == nil {
 		return
 	}
-	snapshot := ParseCodexQuotaHeaders(logging.GetResponseHeaders(ctx))
-	if snapshot == nil {
-		return
+	ApplyCodexQuotaSnapshot(auth, codexQuotaSnapshotFromContext(ctx, provider))
+}
+
+func codexQuotaSnapshotFromContext(ctx context.Context, provider string) *CodexQuotaSnapshot {
+	if !strings.EqualFold(strings.TrimSpace(provider), codexProviderKey) {
+		return nil
 	}
-	ApplyCodexQuotaSnapshot(auth, snapshot)
+	return ParseCodexQuotaHeaders(logging.GetResponseHeaders(ctx))
 }

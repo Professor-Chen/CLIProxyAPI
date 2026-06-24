@@ -113,7 +113,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		if setter, ok := auth.Storage.(metadataSetter); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
+		if _, err = SaveTokenStorageIfChanged(auth.Storage, path); err != nil {
 			return "", err
 		}
 	case auth.Metadata != nil:
@@ -160,6 +160,49 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	}
 
 	return path, nil
+}
+
+// SaveTokenStorageIfChanged stages token storage output and updates path only when
+// the resulting JSON differs from the existing file.
+func SaveTokenStorageIfChanged(storage interface{ SaveTokenToFile(string) error }, path string) (bool, error) {
+	tempPath := path + ".tmp"
+	if err := storage.SaveTokenToFile(tempPath); err != nil {
+		return false, err
+	}
+	defer func() {
+		_ = os.Remove(tempPath)
+	}()
+
+	staged, errReadStaged := os.ReadFile(tempPath)
+	if errReadStaged != nil {
+		if os.IsNotExist(errReadStaged) {
+			return false, nil
+		}
+		return false, fmt.Errorf("auth filestore: read staged token failed: %w", errReadStaged)
+	}
+	if existing, errReadExisting := os.ReadFile(path); errReadExisting == nil {
+		if jsonEqual(existing, staged) {
+			return false, nil
+		}
+		file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if errOpen != nil {
+			return false, fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
+		}
+		if _, errWrite := file.Write(staged); errWrite != nil {
+			_ = file.Close()
+			return false, fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
+		}
+		if errClose := file.Close(); errClose != nil {
+			return false, fmt.Errorf("auth filestore: close existing failed: %w", errClose)
+		}
+		return true, nil
+	} else if !os.IsNotExist(errReadExisting) {
+		return false, fmt.Errorf("auth filestore: read existing failed: %w", errReadExisting)
+	}
+	if errRename := os.Rename(tempPath, path); errRename != nil {
+		return false, fmt.Errorf("auth filestore: rename staged token failed: %w", errRename)
+	}
+	return true, nil
 }
 
 // List enumerates all auth JSON files under the configured directory.

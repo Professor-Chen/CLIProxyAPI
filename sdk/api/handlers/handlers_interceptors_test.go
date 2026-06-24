@@ -772,6 +772,53 @@ func TestHandlerStreamSkipsInterceptorsWhenHostReportsNoStreamInterceptors(t *te
 	}
 }
 
+func TestHandlerStreamSkipsInterceptorsWhenConfigDisablesStreamInterceptors(t *testing.T) {
+	model := "handler-interceptor-config-disabled-stream-model"
+	executor := &interceptorCaptureExecutor{
+		stream: func(ctx context.Context, auth *coreauth.Auth, req coreexecutor.Request, opts coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+			chunks := make(chan coreexecutor.StreamChunk, 1)
+			chunks <- coreexecutor.StreamChunk{Payload: []byte("payload")}
+			close(chunks)
+			return &coreexecutor.StreamResult{
+				Headers: http.Header{"X-Upstream": []string{"stream"}},
+				Chunks:  chunks,
+			}, nil
+		},
+	}
+	streamInterceptors := false
+	handler := newInterceptorHandler(t, model, executor, &sdkconfig.SDKConfig{
+		PassthroughHeaders:       false,
+		PluginStreamInterceptors: &streamInterceptors,
+	})
+	var streamCalls int
+	handler.SetPluginHost(&handlerInterceptorTestHost{
+		interceptStreamChunk: func(ctx context.Context, req pluginapi.StreamChunkInterceptRequest) pluginapi.StreamChunkInterceptResponse {
+			streamCalls++
+			return pluginapi.StreamChunkInterceptResponse{Headers: cloneHeader(req.ResponseHeaders), Body: []byte("should-not-run")}
+		},
+	})
+
+	dataChan, upstreamHeaders, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", model, []byte(fmt.Sprintf(`{"model":%q}`, model)), "")
+	var got []byte
+	for chunk := range dataChan {
+		got = append(got, chunk...)
+	}
+	for msg := range errChan {
+		if msg != nil {
+			t.Fatalf("unexpected stream error: %+v", msg)
+		}
+	}
+	if string(got) != "payload" {
+		t.Fatalf("stream payload = %q, want payload", got)
+	}
+	if upstreamHeaders != nil {
+		t.Fatalf("upstream headers = %#v, want nil without passthrough or stream interceptors", upstreamHeaders)
+	}
+	if streamCalls != 0 {
+		t.Fatalf("stream interceptor calls = %d, want 0", streamCalls)
+	}
+}
+
 func TestAppendStreamInterceptorHistoryBoundsRetainedChunks(t *testing.T) {
 	var history [][]byte
 	for i := 0; i < maxStreamInterceptorHistoryChunks+10; i++ {

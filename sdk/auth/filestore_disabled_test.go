@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
@@ -60,5 +61,55 @@ func TestFileTokenStore_Save_DisabledPersistsFlagForTokenStorage(t *testing.T) {
 	}
 	if disabled, _ := meta["disabled"].(bool); !disabled {
 		t.Fatalf("disabled=%v, want true (raw=%s)", meta["disabled"], string(raw))
+	}
+}
+
+func TestFileTokenStore_Save_TokenStorageSkipsUnchangedTargetWrite(t *testing.T) {
+	ctx := context.Background()
+	baseDir := t.TempDir()
+
+	store := NewFileTokenStore()
+	store.SetBaseDir(baseDir)
+
+	auth := &cliproxyauth.Auth{
+		ID:       "same.json",
+		Provider: "test",
+		FileName: "same.json",
+		Storage:  &testTokenStorage{},
+		Metadata: map[string]any{"type": "test", "access_token": "token"},
+	}
+
+	if _, err := store.Save(ctx, auth); err != nil {
+		t.Fatalf("first Save() error: %v", err)
+	}
+	path := filepath.Join(baseDir, "same.json")
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat auth file before second save: %v", err)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	if _, err := store.Save(ctx, auth); err != nil {
+		t.Fatalf("second Save() error: %v", err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat auth file after second save: %v", err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("unchanged token save updated auth file mtime: before=%s after=%s", before.ModTime(), after.ModTime())
+	}
+
+	auth.Metadata["access_token"] = "new-token"
+	time.Sleep(20 * time.Millisecond)
+	if _, err := store.Save(ctx, auth); err != nil {
+		t.Fatalf("changed Save() error: %v", err)
+	}
+	changed, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat auth file after changed save: %v", err)
+	}
+	if !changed.ModTime().After(after.ModTime()) {
+		t.Fatalf("changed token save did not update auth file mtime: unchanged=%s changed=%s", after.ModTime(), changed.ModTime())
 	}
 }
