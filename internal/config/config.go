@@ -34,6 +34,9 @@ type Config struct {
 	Host string `yaml:"host" json:"-"`
 	// Port is the network port on which the API server will listen.
 	Port int `yaml:"port" json:"-"`
+	// VirtualPoolListeners exposes additional business-only API ports that
+	// transparently route requests through prefixed credential pools.
+	VirtualPoolListeners []VirtualPoolListener `yaml:"virtual-pool-listeners,omitempty" json:"virtual-pool-listeners,omitempty"`
 
 	// TLS config controls HTTPS server settings.
 	TLS TLSConfig `yaml:"tls" json:"tls"`
@@ -167,6 +170,16 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
+}
+
+// VirtualPoolListener binds a dedicated API port to an internal model prefix.
+// The listener shares the same runtime/auth directory as the main server, but
+// management endpoints are intentionally not exposed on these business ports.
+type VirtualPoolListener struct {
+	Name   string `yaml:"name" json:"name"`
+	Host   string `yaml:"host,omitempty" json:"host,omitempty"`
+	Port   int    `yaml:"port" json:"port"`
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 }
 
 // PluginsConfig holds dynamic plugin system settings.

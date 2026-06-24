@@ -414,6 +414,9 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 				emailValue := gjson.GetBytes(data, "email").String()
 				fileData["type"] = typeValue
 				fileData["email"] = emailValue
+				if prefix := strings.TrimSpace(gjson.GetBytes(data, "prefix").String()); prefix != "" {
+					fileData["prefix"] = prefix
+				}
 				if projectID := strings.TrimSpace(gjson.GetBytes(data, "project_id").String()); projectID != "" {
 					fileData["project_id"] = projectID
 				}
@@ -495,6 +498,13 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if projectID := authProjectID(auth); projectID != "" {
 		entry["project_id"] = projectID
+	}
+	// Expose the business virtual-pool prefix (e.g. "pro") so management UIs
+	// can group/count credentials by virtual pool. Empty means the
+	// credential serves the default (no-prefix) pool. Only reachable through
+	// the secret-key protected management API.
+	if prefix := authPrefix(auth); prefix != "" {
+		entry["prefix"] = prefix
 	}
 	// Expose the per-credential outbound proxy so management UIs can show
 	// and balance egress IPs across a credential pool. Empty means the
@@ -646,6 +656,28 @@ func authProjectID(auth *coreauth.Auth) string {
 	if auth.Attributes != nil {
 		if projectID := strings.TrimSpace(auth.Attributes["project_id"]); projectID != "" {
 			return projectID
+		}
+	}
+	return ""
+}
+
+func authPrefix(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if p := strings.TrimSpace(auth.Prefix); p != "" {
+		return p
+	}
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["prefix"].(string); ok {
+			if p := strings.TrimSpace(v); p != "" {
+				return p
+			}
+		}
+	}
+	if auth.Attributes != nil {
+		if p := strings.TrimSpace(auth.Attributes["prefix"]); p != "" {
+			return p
 		}
 	}
 	return ""

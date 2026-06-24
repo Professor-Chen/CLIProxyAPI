@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -168,6 +169,84 @@ func TestNewServerWithoutPluginHostLeavesHandlerInterceptorsDisabled(t *testing.
 	}
 	if server.handlers.PluginHost != nil {
 		t.Fatalf("handler plugin host = %#v, want nil", server.handlers.PluginHost)
+	}
+}
+
+func TestNormalizedVirtualPoolListeners(t *testing.T) {
+	server := newTestServer(t)
+	server.cfg.Host = "127.0.0.1"
+	server.cfg.Port = 8317
+	server.cfg.VirtualPoolListeners = []proxyconfig.VirtualPoolListener{
+		{Name: " Pro ", Port: 8318, Prefix: "/pro/"},
+		{Port: 8319},
+	}
+
+	listeners, err := server.normalizedVirtualPoolListeners()
+	if err != nil {
+		t.Fatalf("normalizedVirtualPoolListeners() error = %v", err)
+	}
+	if len(listeners) != 2 {
+		t.Fatalf("listeners len = %d, want 2", len(listeners))
+	}
+	if listeners[0].Name != "Pro" || listeners[0].Host != "127.0.0.1" || listeners[0].Prefix != "pro" {
+		t.Fatalf("first listener = %+v, want normalized pro listener", listeners[0])
+	}
+	if listeners[1].Name != "port-8319" || listeners[1].Host != "127.0.0.1" || listeners[1].Prefix != "" {
+		t.Fatalf("second listener = %+v, want default listener name", listeners[1])
+	}
+}
+
+func TestNormalizedVirtualPoolListenersRejectsDuplicateAddress(t *testing.T) {
+	server := newTestServer(t)
+	server.cfg.Host = "127.0.0.1"
+	server.cfg.Port = 8317
+	server.cfg.VirtualPoolListeners = []proxyconfig.VirtualPoolListener{
+		{Name: "duplicate-main", Port: 8317, Prefix: "pro"},
+	}
+
+	if _, err := server.normalizedVirtualPoolListeners(); err == nil {
+		t.Fatal("normalizedVirtualPoolListeners() error = nil, want duplicate address error")
+	}
+}
+
+func TestRewriteVirtualPoolRequestModel(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5","messages":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	rewriteVirtualPoolRequestModel(req, "pro")
+
+	raw, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v; body=%s", err, string(raw))
+	}
+	if payload["model"] != "pro/gpt-5" {
+		t.Fatalf("model = %q, want pro/gpt-5", payload["model"])
+	}
+	if req.ContentLength != int64(len(raw)) {
+		t.Fatalf("ContentLength = %d, want %d", req.ContentLength, len(raw))
+	}
+}
+
+func TestRewriteVirtualPoolRequestModelDoesNotDoublePrefix(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"pro/gpt-5","input":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	rewriteVirtualPoolRequestModel(req, "pro")
+
+	raw, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v; body=%s", err, string(raw))
+	}
+	if payload["model"] != "pro/gpt-5" {
+		t.Fatalf("model = %q, want pro/gpt-5", payload["model"])
 	}
 }
 

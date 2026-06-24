@@ -279,6 +279,71 @@ func (h *Handler) PutForceModelPrefix(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.ForceModelPrefix = v })
 }
 
+func (h *Handler) GetVirtualPoolListeners(c *gin.Context) {
+	if h == nil || h.cfg == nil {
+		c.JSON(http.StatusOK, gin.H{"virtual-pool-listeners": []config.VirtualPoolListener{}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"virtual-pool-listeners": h.cfg.VirtualPoolListeners})
+}
+
+func (h *Handler) PutVirtualPoolListeners(c *gin.Context) {
+	bodyBytes, errRead := io.ReadAll(c.Request.Body)
+	if errRead != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	var body struct {
+		Listeners *[]config.VirtualPoolListener `json:"virtual-pool-listeners"`
+	}
+	if errUnmarshal := json.Unmarshal(bodyBytes, &body); errUnmarshal != nil || body.Listeners == nil {
+		var direct []config.VirtualPoolListener
+		if errDecode := json.Unmarshal(bodyBytes, &direct); errDecode != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+			return
+		}
+		body.Listeners = &direct
+	}
+	listeners, errValidate := normalizeVirtualPoolListeners(*body.Listeners)
+	if errValidate != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errValidate.Error()})
+		return
+	}
+	h.cfg.VirtualPoolListeners = listeners
+	h.persist(c)
+}
+
+func normalizeVirtualPoolListeners(listeners []config.VirtualPoolListener) ([]config.VirtualPoolListener, error) {
+	out := make([]config.VirtualPoolListener, 0, len(listeners))
+	seen := make(map[string]struct{}, len(listeners))
+	for _, raw := range listeners {
+		listener := raw
+		listener.Name = strings.TrimSpace(listener.Name)
+		listener.Host = strings.TrimSpace(listener.Host)
+		listener.Prefix = strings.Trim(strings.TrimSpace(listener.Prefix), "/")
+		if listener.Port <= 0 {
+			return nil, fmt.Errorf("virtual pool listener %q has invalid port %d", listener.Name, listener.Port)
+		}
+		if strings.Contains(listener.Prefix, "/") {
+			return nil, fmt.Errorf("virtual pool listener %q prefix must not contain '/'", listener.Name)
+		}
+		if listener.Name == "" {
+			if listener.Prefix != "" {
+				listener.Name = listener.Prefix
+			} else {
+				listener.Name = fmt.Sprintf("port-%d", listener.Port)
+			}
+		}
+		key := fmt.Sprintf("%s:%d", listener.Host, listener.Port)
+		if _, exists := seen[key]; exists {
+			return nil, fmt.Errorf("duplicate virtual pool listener address %s", key)
+		}
+		seen[key] = struct{}{}
+		out = append(out, listener)
+	}
+	return out, nil
+}
+
 func normalizeRoutingStrategy(strategy string) (string, bool) {
 	normalized := strings.ToLower(strings.TrimSpace(strategy))
 	switch normalized {

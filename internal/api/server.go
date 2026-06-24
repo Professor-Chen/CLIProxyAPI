@@ -5,16 +5,19 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,6 +47,8 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"golang.org/x/net/http2"
 	"gopkg.in/yaml.v3"
 )
@@ -196,9 +201,13 @@ type Server struct {
 
 	// server is the underlying HTTP server.
 	server *http.Server
+	// virtualPoolServers are additional business-only API listeners.
+	virtualPoolServers []*http.Server
 
 	// muxBaseListener is the shared TCP listener used to serve both HTTP and Redis protocol traffic.
-	muxBaseListener net.Listener
+	muxBaseListener      net.Listener
+	virtualPoolMu        sync.Mutex
+	virtualPoolListeners []net.Listener
 
 	// muxHTTPListener receives HTTP connections selected by the multiplexer.
 	muxHTTPListener *muxListener
@@ -776,6 +785,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/force-model-prefix", s.mgmt.GetForceModelPrefix)
 		mgmt.PUT("/force-model-prefix", s.mgmt.PutForceModelPrefix)
 		mgmt.PATCH("/force-model-prefix", s.mgmt.PutForceModelPrefix)
+		mgmt.GET("/virtual-pool-listeners", s.mgmt.GetVirtualPoolListeners)
+		mgmt.PUT("/virtual-pool-listeners", s.mgmt.PutVirtualPoolListeners)
+		mgmt.PATCH("/virtual-pool-listeners", s.mgmt.PutVirtualPoolListeners)
 
 		mgmt.GET("/routing/strategy", s.mgmt.GetRoutingStrategy)
 		mgmt.PUT("/routing/strategy", s.mgmt.PutRoutingStrategy)
@@ -1550,6 +1562,13 @@ func (s *Server) Start() error {
 		log.Debugf("Starting API server on %s", addr)
 	}
 
+	if errVirtualPools := s.startVirtualPoolListeners(s.server.TLSConfig); errVirtualPools != nil {
+		if errClose := listener.Close(); errClose != nil {
+			log.Debugf("failed to close main listener after virtual pool listener failure: %v", errClose)
+		}
+		return errVirtualPools
+	}
+
 	httpListener := newMuxListener(listener.Addr(), 1024)
 	s.muxBaseListener = listener
 	s.muxHTTPListener = httpListener
@@ -1606,6 +1625,215 @@ func (s *Server) Start() error {
 	}
 }
 
+func (s *Server) startVirtualPoolListeners(tlsConfig *tls.Config) error {
+	s.virtualPoolMu.Lock()
+	defer s.virtualPoolMu.Unlock()
+	return s.startVirtualPoolListenersLocked(tlsConfig)
+}
+
+func (s *Server) startVirtualPoolListenersLocked(tlsConfig *tls.Config) error {
+	listeners, errNormalize := s.normalizedVirtualPoolListeners()
+	if errNormalize != nil {
+		return errNormalize
+	}
+	if len(listeners) == 0 {
+		return nil
+	}
+
+	for _, listenerCfg := range listeners {
+		addr := fmt.Sprintf("%s:%d", listenerCfg.Host, listenerCfg.Port)
+		listener, errListen := net.Listen("tcp", addr)
+		if errListen != nil {
+			s.closeVirtualPoolServersLocked()
+			return fmt.Errorf("failed to start virtual pool listener %q on %s: %w", listenerCfg.Name, addr, errListen)
+		}
+
+		server := &http.Server{
+			Addr:    addr,
+			Handler: s.virtualPoolHTTPHandler(listenerCfg.Prefix),
+		}
+		if tlsConfig != nil {
+			server.TLSConfig = tlsConfig.Clone()
+			if errHTTP2 := http2.ConfigureServer(server, &http2.Server{}); errHTTP2 != nil {
+				log.Warnf("failed to configure HTTP/2 for virtual pool listener %q: %v", listenerCfg.Name, errHTTP2)
+			}
+			listener = tls.NewListener(listener, server.TLSConfig)
+		}
+
+		s.virtualPoolServers = append(s.virtualPoolServers, server)
+		s.virtualPoolListeners = append(s.virtualPoolListeners, listener)
+		log.Infof("Starting virtual pool API listener %q on %s", listenerCfg.Name, addr)
+
+		go func(srv *http.Server, ln net.Listener) {
+			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+				log.Errorf("virtual pool listener %s stopped unexpectedly: %v", srv.Addr, err)
+			}
+		}(server, listener)
+	}
+	return nil
+}
+
+func (s *Server) normalizedVirtualPoolListeners() ([]config.VirtualPoolListener, error) {
+	if s == nil || s.cfg == nil || len(s.cfg.VirtualPoolListeners) == 0 {
+		return nil, nil
+	}
+	mainAddr := fmt.Sprintf("%s:%d", strings.TrimSpace(s.cfg.Host), s.cfg.Port)
+	seen := map[string]struct{}{mainAddr: {}}
+	out := make([]config.VirtualPoolListener, 0, len(s.cfg.VirtualPoolListeners))
+	for _, raw := range s.cfg.VirtualPoolListeners {
+		listener := raw
+		listener.Host = strings.TrimSpace(listener.Host)
+		if listener.Host == "" {
+			listener.Host = strings.TrimSpace(s.cfg.Host)
+		}
+		listener.Name = strings.TrimSpace(listener.Name)
+		listener.Prefix = strings.Trim(strings.TrimSpace(listener.Prefix), "/")
+		if listener.Port <= 0 {
+			return nil, fmt.Errorf("virtual pool listener %q has invalid port %d", listener.Name, listener.Port)
+		}
+		if strings.Contains(listener.Prefix, "/") {
+			return nil, fmt.Errorf("virtual pool listener %q prefix must not contain '/'", listener.Name)
+		}
+		if listener.Name == "" {
+			if listener.Prefix != "" {
+				listener.Name = listener.Prefix
+			} else {
+				listener.Name = fmt.Sprintf("port-%d", listener.Port)
+			}
+		}
+		addr := fmt.Sprintf("%s:%d", listener.Host, listener.Port)
+		if _, exists := seen[addr]; exists {
+			return nil, fmt.Errorf("virtual pool listener %q duplicates address %s", listener.Name, addr)
+		}
+		seen[addr] = struct{}{}
+		out = append(out, listener)
+	}
+	return out, nil
+}
+
+func (s *Server) virtualPoolHTTPHandler(prefix string) http.Handler {
+	prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r != nil && isVirtualPoolManagementPath(r.URL.Path) {
+			http.NotFound(w, r)
+			return
+		}
+		rewriteVirtualPoolRequestModel(r, prefix)
+		s.engine.ServeHTTP(w, r)
+	})
+}
+
+func isVirtualPoolManagementPath(path string) bool {
+	path = strings.TrimSpace(path)
+	return path == "/management.html" ||
+		path == "/v0/management" ||
+		strings.HasPrefix(path, "/v0/management/") ||
+		path == "/v0/resource/plugins" ||
+		strings.HasPrefix(path, "/v0/resource/plugins/")
+}
+
+func rewriteVirtualPoolRequestModel(r *http.Request, prefix string) {
+	prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	if r == nil || prefix == "" || r.Method != http.MethodPost || r.Body == nil {
+		return
+	}
+	if !isVirtualPoolModelRewritePath(r.URL.Path) {
+		return
+	}
+	contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	if contentType != "" && !strings.Contains(contentType, "application/json") {
+		return
+	}
+
+	body, errRead := io.ReadAll(r.Body)
+	if errRead != nil {
+		resetRequestBody(r, body)
+		return
+	}
+	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	if model == "" || strings.HasPrefix(model, prefix+"/") {
+		resetRequestBody(r, body)
+		return
+	}
+	rewritten, errSet := sjson.SetBytes(body, "model", prefix+"/"+model)
+	if errSet != nil {
+		resetRequestBody(r, body)
+		return
+	}
+	resetRequestBody(r, rewritten)
+}
+
+func isVirtualPoolModelRewritePath(path string) bool {
+	switch path {
+	case "/v1/chat/completions",
+		"/v1/completions",
+		"/v1/images/generations",
+		"/v1/videos",
+		"/v1/videos/generations",
+		"/v1/responses",
+		"/v1/responses/compact",
+		"/backend-api/codex/responses",
+		"/backend-api/codex/responses/compact":
+		return true
+	default:
+		return false
+	}
+}
+
+func resetRequestBody(r *http.Request, body []byte) {
+	if r == nil {
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+}
+
+func (s *Server) closeVirtualPoolListeners() {
+	s.virtualPoolMu.Lock()
+	defer s.virtualPoolMu.Unlock()
+	s.closeVirtualPoolListenersLocked()
+}
+
+func (s *Server) closeVirtualPoolListenersLocked() {
+	for _, listener := range s.virtualPoolListeners {
+		if listener != nil {
+			_ = listener.Close()
+		}
+	}
+	s.virtualPoolListeners = nil
+}
+
+func (s *Server) closeVirtualPoolServersLocked() {
+	for _, server := range s.virtualPoolServers {
+		if server != nil {
+			_ = server.Close()
+		}
+	}
+	s.virtualPoolServers = nil
+	s.closeVirtualPoolListenersLocked()
+}
+
+func (s *Server) reloadVirtualPoolListenersIfNeeded(oldCfg, newCfg *config.Config) {
+	if s == nil || newCfg == nil {
+		return
+	}
+	if oldCfg != nil && reflect.DeepEqual(oldCfg.VirtualPoolListeners, newCfg.VirtualPoolListeners) &&
+		strings.TrimSpace(oldCfg.Host) == strings.TrimSpace(newCfg.Host) &&
+		oldCfg.Port == newCfg.Port &&
+		oldCfg.TLS.Enable == newCfg.TLS.Enable {
+		return
+	}
+	s.virtualPoolMu.Lock()
+	defer s.virtualPoolMu.Unlock()
+	s.closeVirtualPoolServersLocked()
+	if err := s.startVirtualPoolListenersLocked(s.server.TLSConfig); err != nil {
+		log.Errorf("failed to reload virtual pool listeners: %v", err)
+	}
+}
+
 // Stop gracefully shuts down the API server without interrupting any
 // active connections.
 //
@@ -1632,11 +1860,21 @@ func (s *Server) Stop(ctx context.Context) error {
 			log.Debugf("failed to close shared listener: %v", errClose)
 		}
 	}
+	s.closeVirtualPoolListeners()
 
 	// Shutdown the HTTP server.
 	if err := s.server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", err)
 	}
+	for _, server := range s.virtualPoolServers {
+		if server == nil {
+			continue
+		}
+		if err := server.Shutdown(ctx); err != nil {
+			return fmt.Errorf("failed to shutdown virtual pool HTTP server: %v", err)
+		}
+	}
+	s.virtualPoolServers = nil
 
 	log.Debug("API server stopped")
 	return nil
@@ -1789,6 +2027,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		s.exampleAPIKeySafeModeActive.Store(exampleAPIKeySafeModeRequired)
 	}
 	s.cfg = cfg
+	s.reloadVirtualPoolListenersIfNeeded(oldCfg, cfg)
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != cfg.WebsocketAuth {
 		s.wsAuthChanged(oldCfg.WebsocketAuth, cfg.WebsocketAuth)
