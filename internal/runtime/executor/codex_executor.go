@@ -793,62 +793,120 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	var identityState codexIdentityConfuseState
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body)
-	if err != nil {
-		return resp, err
-	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
-	applyModelHeaderOverrides(httpReq.Header, baseModel)
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      upstreamBody,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
-	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("codex executor: close response body error: %v", errClose)
+	var (
+		identityState codexIdentityConfuseState
+		httpResp      *http.Response
+		upstreamData  []byte
+		lastStatusErr error
+	)
+	requestBody := body
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			stripped, n := stripOpenAIResponsesEncryptedContent(requestBody)
+			if n == 0 {
+				if lastStatusErr != nil {
+					return resp, lastStatusErr
+				}
+				break
+			}
+			requestBody = stripped
+			if replayScope.valid() {
+				if errClearReplay := internalcache.DeleteCodexReasoningReplayItemRequired(ctx, replayScope.modelName, replayScope.sessionKey); errClearReplay != nil {
+					helps.LogWithRequestID(ctx).Debugf("codex executor: clear reasoning replay after invalid encrypted_content: %v", errClearReplay)
+				}
+			}
+			helps.LogWithRequestID(ctx).Infof("codex executor: retrying after stripping %d encrypted_content field(s) rejected by upstream", n)
 		}
-	}()
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		b = applyCodexIdentityConfuseResponsePayload(b, identityState)
-		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, b); errClearReplay != nil {
-			return resp, errClearReplay
+
+		httpReq, upstreamBody, nextIdentity, reqErr := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, requestBody)
+		if reqErr != nil {
+			return resp, reqErr
 		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = newCodexStatusErr(httpResp.StatusCode, b)
+		identityState = nextIdentity
+		applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+		applyModelHeaderOverrides(httpReq.Header, baseModel)
+		applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      upstreamBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient = reporter.TrackHTTPClient(httpClient)
+		httpResp, err = httpClient.Do(httpReq)
+		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+			return resp, err
+		}
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			b, _ := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			b = applyCodexIdentityConfuseResponsePayload(b, identityState)
+			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, b); errClearReplay != nil {
+				return resp, errClearReplay
+			}
+			helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+			lastStatusErr = newCodexStatusErr(httpResp.StatusCode, b)
+			if attempt == 0 && isCodexThinkingSignatureInvalid(httpResp.StatusCode, b) {
+				continue
+			}
+			return resp, lastStatusErr
+		}
+		data, readErr := io.ReadAll(httpResp.Body)
+		_ = httpResp.Body.Close()
+		if readErr != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+			return resp, readErr
+		}
+		upstreamData = applyCodexIdentityConfuseResponsePayload(data, identityState)
+		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
+
+		// SSE-in-body may still surface encrypted_content rejection as a terminal event.
+		if attempt == 0 {
+			retryAfterStrip := false
+			for _, line := range bytes.Split(upstreamData, []byte("\n")) {
+				if !bytes.HasPrefix(line, dataTag) {
+					continue
+				}
+				eventData := bytes.TrimSpace(line[5:])
+				if streamErr, terminalBody, ok := codexTerminalStreamErr(eventData); ok {
+					_ = clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody)
+					if isCodexThinkingSignatureInvalid(streamErr.StatusCode(), terminalBody) {
+						lastStatusErr = streamErr
+						retryAfterStrip = true
+						break
+					}
+				}
+			}
+			if retryAfterStrip {
+				continue
+			}
+		}
+		body = requestBody
+		lastStatusErr = nil
+		break
+	}
+	if lastStatusErr != nil {
+		return resp, lastStatusErr
+	}
+	if len(upstreamData) == 0 {
+		err = statusErr{code: 408, msg: "stream error: stream disconnected before completion: stream closed before response.completed"}
 		return resp, err
 	}
-	data, err := io.ReadAll(httpResp.Body)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
-	}
-	upstreamData := applyCodexIdentityConfuseResponsePayload(data, identityState)
-	helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 
 	lines := bytes.Split(upstreamData, []byte("\n"))
 	outputItemsByIndex := make(map[int64][]byte)
@@ -1081,57 +1139,90 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/responses"
-	var identityState codexIdentityConfuseState
-	httpReq, upstreamBody, identityState, err := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, body)
-	if err != nil {
-		return nil, err
-	}
-	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
-	applyModelHeaderOverrides(httpReq.Header, baseModel)
-	applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      upstreamBody,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
+	requestBody := body
+	var (
+		httpResp      *http.Response
+		identityState codexIdentityConfuseState
+		lastStatusErr error
+	)
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			stripped, n := stripOpenAIResponsesEncryptedContent(requestBody)
+			if n == 0 {
+				if lastStatusErr != nil {
+					return nil, lastStatusErr
+				}
+				break
+			}
+			requestBody = stripped
+			if replayScope.valid() {
+				_ = internalcache.DeleteCodexReasoningReplayItemRequired(ctx, replayScope.modelName, replayScope.sessionKey)
+			}
+			helps.LogWithRequestID(ctx).Infof("codex executor: stream retry after stripping %d encrypted_content field(s) rejected by upstream", n)
+		}
 
-	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
+		httpReq, upstreamBody, nextIdentity, reqErr := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, requestBody)
+		if reqErr != nil {
+			return nil, reqErr
+		}
+		identityState = nextIdentity
+		applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg)
+		applyModelHeaderOverrides(httpReq.Header, baseModel)
+		applyCodexIdentityConfuseHeaders(httpReq.Header, &identityState)
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      upstreamBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+
+		httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
+		httpClient = reporter.TrackHTTPClient(httpClient)
+		httpResp, err = httpClient.Do(httpReq)
+		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+			return nil, err
+		}
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			data, readErr := io.ReadAll(httpResp.Body)
+			_ = httpResp.Body.Close()
+			if readErr != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, readErr)
+				return nil, readErr
+			}
+			data = applyCodexIdentityConfuseResponsePayload(data, identityState)
+			if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, data); errClearReplay != nil {
+				return nil, errClearReplay
+			}
+			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
+			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
+			lastStatusErr = newCodexStatusErr(httpResp.StatusCode, data)
+			if attempt == 0 && isCodexThinkingSignatureInvalid(httpResp.StatusCode, data) {
+				continue
+			}
+			return nil, lastStatusErr
+		}
+		body = requestBody
+		lastStatusErr = nil
+		break
 	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		data, readErr := io.ReadAll(httpResp.Body)
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("codex executor: close response body error: %v", errClose)
-		}
-		if readErr != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, readErr)
-			return nil, readErr
-		}
-		data = applyCodexIdentityConfuseResponsePayload(data, identityState)
-		if errClearReplay := clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, httpResp.StatusCode, data); errClearReplay != nil {
-			return nil, errClearReplay
-		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
-		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = newCodexStatusErr(httpResp.StatusCode, data)
-		return nil, err
+	if lastStatusErr != nil {
+		return nil, lastStatusErr
+	}
+	if httpResp == nil || httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return nil, fmt.Errorf("codex executor: empty upstream response")
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
@@ -1714,7 +1805,12 @@ func codexStatusErrorClassification(statusCode int, body []byte) (code string, e
 	switch {
 	case statusCode == http.StatusRequestEntityTooLarge || upstreamCode == "context_length_exceeded" || upstreamCode == "context_too_large" || isInvalidRequest && (strings.Contains(errorMessage, "context length") || strings.Contains(errorMessage, "context_length") || strings.Contains(errorMessage, "maximum context") || strings.Contains(errorMessage, "too many tokens")):
 		return "context_too_large", "invalid_request_error", true
-	case strings.Contains(lower, "invalid signature in thinking block") || strings.Contains(lower, "invalid_encrypted_content"):
+	case strings.Contains(lower, "invalid signature in thinking block") ||
+		strings.Contains(lower, "invalid_encrypted_content") ||
+		// OpenAI/Codex Responses: cross-account or corrupted reasoning.encrypted_content.
+		strings.Contains(lower, "could not be verified") ||
+		strings.Contains(lower, "could not be decrypted or parsed") ||
+		(strings.Contains(lower, "encrypted content") && strings.Contains(lower, "could not")):
 		return "thinking_signature_invalid", "invalid_request_error", true
 	case upstreamCode == "previous_response_not_found" || strings.Contains(lower, "previous_response_not_found") || strings.Contains(lower, "previous_response_id") && strings.Contains(lower, "not found"):
 		return "previous_response_not_found", "invalid_request_error", true

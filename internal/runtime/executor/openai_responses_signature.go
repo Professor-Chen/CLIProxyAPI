@@ -23,7 +23,10 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 
 	updated := body
 	for index, item := range input.Array() {
-		if strings.TrimSpace(item.Get("type").String()) != "reasoning" {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		// reasoning + compaction both carry opaque encrypted_content that must
+		// stay account-bound; drop plaintext / foreign / malformed blobs early.
+		if itemType != "reasoning" && itemType != "compaction" {
 			continue
 		}
 
@@ -53,7 +56,7 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 
 		next, err := sjson.DeleteBytes(updated, encryptedContentPath)
 		if err != nil {
-			helps.LogWithRequestID(ctx).Debugf("%s: failed to drop invalid reasoning encrypted_content at input[%d]: %v", provider, index, err)
+			helps.LogWithRequestID(ctx).Debugf("%s: failed to drop invalid %s encrypted_content at input[%d]: %v", provider, itemType, index, err)
 			continue
 		}
 		updated = next
@@ -62,7 +65,41 @@ func sanitizeOpenAIResponsesReasoningEncryptedContent(ctx context.Context, provi
 		if itemID == "" {
 			itemID = fmt.Sprintf("input[%d]", index)
 		}
-		helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid reasoning encrypted_content at input[%d] item_id=%q reason=%s", provider, index, itemID, reason)
+		helps.LogWithRequestID(ctx).Debugf("%s: dropped invalid %s encrypted_content at input[%d] item_id=%q reason=%s", provider, itemType, index, itemID, reason)
 	}
 	return updated
+}
+
+// stripOpenAIResponsesEncryptedContent removes every encrypted_content field from
+// input reasoning/compaction items. Used after upstream rejects a shape-valid but
+// non-decryptable blob (typically cross-account sticky miss).
+func stripOpenAIResponsesEncryptedContent(body []byte) ([]byte, int) {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || !input.IsArray() {
+		return body, 0
+	}
+	updated := body
+	stripped := 0
+	for index, item := range input.Array() {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if itemType != "reasoning" && itemType != "compaction" {
+			continue
+		}
+		path := fmt.Sprintf("input.%d.encrypted_content", index)
+		if !gjson.GetBytes(updated, path).Exists() {
+			continue
+		}
+		next, err := sjson.DeleteBytes(updated, path)
+		if err != nil {
+			continue
+		}
+		updated = next
+		stripped++
+	}
+	return updated, stripped
+}
+
+func isCodexThinkingSignatureInvalid(statusCode int, body []byte) bool {
+	code, _, ok := codexStatusErrorClassification(statusCode, body)
+	return ok && code == "thinking_signature_invalid"
 }
