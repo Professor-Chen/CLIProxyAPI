@@ -785,6 +785,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
+	if strippedRefs, nRefs := stripOpenAIResponsesItemReferences(body); nRefs > 0 {
+		body = strippedRefs
+		helps.LogWithRequestID(ctx).Infof("codex executor: stripped %d item_reference input row(s) (store=false)", nRefs)
+	}
 	body = normalizeCodexParallelToolCallsForTools(body)
 	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
 	if errReplay != nil {
@@ -798,24 +802,26 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		httpResp      *http.Response
 		upstreamData  []byte
 		lastStatusErr error
+		lastStatus    int
+		lastErrBody   []byte
 	)
 	requestBody := body
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			stripped, n := stripOpenAIResponsesEncryptedContent(requestBody)
-			if n == 0 {
+			nextBody, reason, okRetry := prepareCodexResponsesRetryBody(requestBody, lastStatus, lastErrBody)
+			if !okRetry {
 				if lastStatusErr != nil {
 					return resp, lastStatusErr
 				}
 				break
 			}
-			requestBody = stripped
-			if replayScope.valid() {
+			requestBody = nextBody
+			if strings.HasPrefix(reason, "encrypted_content") && replayScope.valid() {
 				if errClearReplay := internalcache.DeleteCodexReasoningReplayItemRequired(ctx, replayScope.modelName, replayScope.sessionKey); errClearReplay != nil {
 					helps.LogWithRequestID(ctx).Debugf("codex executor: clear reasoning replay after invalid encrypted_content: %v", errClearReplay)
 				}
 			}
-			helps.LogWithRequestID(ctx).Infof("codex executor: retrying after stripping %d encrypted_content field(s) rejected by upstream", n)
+			helps.LogWithRequestID(ctx).Infof("codex executor: retrying after recoverable upstream rejection (%s)", reason)
 		}
 
 		httpReq, upstreamBody, nextIdentity, reqErr := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, requestBody)
@@ -861,7 +867,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 			lastStatusErr = newCodexStatusErr(httpResp.StatusCode, b)
-			if attempt == 0 && isCodexThinkingSignatureInvalid(httpResp.StatusCode, b) {
+			lastStatus = httpResp.StatusCode
+			lastErrBody = b
+			if _, _, okRetry := prepareCodexResponsesRetryBody(requestBody, lastStatus, lastErrBody); okRetry {
 				continue
 			}
 			return resp, lastStatusErr
@@ -875,8 +883,8 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		upstreamData = applyCodexIdentityConfuseResponsePayload(data, identityState)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, upstreamData)
 
-		// SSE-in-body may still surface encrypted_content rejection as a terminal event.
-		if attempt == 0 {
+		// SSE-in-body may still surface recoverable rejection as a terminal event.
+		if attempt < 2 {
 			retryAfterStrip := false
 			for _, line := range bytes.Split(upstreamData, []byte("\n")) {
 				if !bytes.HasPrefix(line, dataTag) {
@@ -885,8 +893,10 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 				eventData := bytes.TrimSpace(line[5:])
 				if streamErr, terminalBody, ok := codexTerminalStreamErr(eventData); ok {
 					_ = clearCodexReasoningReplayOnInvalidSignature(ctx, replayScope, streamErr.StatusCode(), terminalBody)
-					if isCodexThinkingSignatureInvalid(streamErr.StatusCode(), terminalBody) {
+					if _, _, okRetry := prepareCodexResponsesRetryBody(requestBody, streamErr.StatusCode(), terminalBody); okRetry {
 						lastStatusErr = streamErr
+						lastStatus = streamErr.StatusCode()
+						lastErrBody = terminalBody
 						retryAfterStrip = true
 						break
 					}
@@ -1131,6 +1141,10 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		body = ensureImageGenerationTool(body, baseModel, auth)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "codex executor", body)
+	if strippedRefs, nRefs := stripOpenAIResponsesItemReferences(body); nRefs > 0 {
+		body = strippedRefs
+		helps.LogWithRequestID(ctx).Infof("codex executor: stripped %d item_reference input row(s) (store=false)", nRefs)
+	}
 	body = normalizeCodexParallelToolCallsForTools(body)
 	body, replayScope, errReplay := applyCodexReasoningReplayCacheRequired(ctx, from, req, opts, body)
 	if errReplay != nil {
@@ -1144,21 +1158,23 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		httpResp      *http.Response
 		identityState codexIdentityConfuseState
 		lastStatusErr error
+		lastStatus    int
+		lastErrBody   []byte
 	)
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			stripped, n := stripOpenAIResponsesEncryptedContent(requestBody)
-			if n == 0 {
+			nextBody, reason, okRetry := prepareCodexResponsesRetryBody(requestBody, lastStatus, lastErrBody)
+			if !okRetry {
 				if lastStatusErr != nil {
 					return nil, lastStatusErr
 				}
 				break
 			}
-			requestBody = stripped
-			if replayScope.valid() {
+			requestBody = nextBody
+			if strings.HasPrefix(reason, "encrypted_content") && replayScope.valid() {
 				_ = internalcache.DeleteCodexReasoningReplayItemRequired(ctx, replayScope.modelName, replayScope.sessionKey)
 			}
-			helps.LogWithRequestID(ctx).Infof("codex executor: stream retry after stripping %d encrypted_content field(s) rejected by upstream", n)
+			helps.LogWithRequestID(ctx).Infof("codex executor: stream retry after recoverable upstream rejection (%s)", reason)
 		}
 
 		httpReq, upstreamBody, nextIdentity, reqErr := e.cacheHelper(ctx, from, url, auth, req, originalPayloadSource, requestBody)
@@ -1209,7 +1225,9 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 			helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 			helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 			lastStatusErr = newCodexStatusErr(httpResp.StatusCode, data)
-			if attempt == 0 && isCodexThinkingSignatureInvalid(httpResp.StatusCode, data) {
+			lastStatus = httpResp.StatusCode
+			lastErrBody = data
+			if _, _, okRetry := prepareCodexResponsesRetryBody(requestBody, lastStatus, lastErrBody); okRetry {
 				continue
 			}
 			return nil, lastStatusErr
