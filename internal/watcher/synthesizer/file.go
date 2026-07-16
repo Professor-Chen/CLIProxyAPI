@@ -207,17 +207,52 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	coreauth.SetOAuthModelAliasesAttribute(a, perAccountModelAliases)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
-	// For codex auth files, extract plan_type from the JWT id_token.
+	// Codex plan_type drives tiered model registration. Prefer file metadata
+	// (written by quota probe / import) over id_token claims: JWT chatgpt_plan_type
+	// can lag after upgrades (e.g. file says plus while stale token still says free),
+	// which would incorrectly register the free catalog and drop sol/5.4.
 	if provider == "codex" {
-		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
-			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
-				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
-					a.Attributes["plan_type"] = pt
-				}
-			}
+		if pt := resolveCodexPlanType(metadata); pt != "" {
+			a.Attributes["plan_type"] = pt
 		}
 	}
 	return []*coreauth.Auth{a}
+}
+
+func resolveCodexPlanType(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	for _, key := range []string{"plan_type", "chatgpt_plan_type"} {
+		if pt := metadataString(metadata, key); pt != "" {
+			return pt
+		}
+	}
+	idTokenRaw, _ := metadata["id_token"].(string)
+	if strings.TrimSpace(idTokenRaw) == "" {
+		return ""
+	}
+	claims, errParse := codex.ParseJWTToken(idTokenRaw)
+	if errParse != nil || claims == nil {
+		return ""
+	}
+	return strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	raw, ok := metadata[key]
+	if !ok || raw == nil {
+		return ""
+	}
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	default:
+		return ""
+	}
 }
 
 func parsePluginFileAuths(parser PluginAuthParser, req pluginapi.AuthParseRequest) ([]*coreauth.Auth, bool, error) {

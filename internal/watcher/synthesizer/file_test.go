@@ -2,9 +2,11 @@ package synthesizer
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -697,4 +699,86 @@ func TestFileSynthesizer_Synthesize_NoteParsing(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveCodexPlanType_PrefersFileMetadataOverStaleJWT(t *testing.T) {
+	staleFreeJWT := fakeCodexIDToken(t, "free")
+
+	got := resolveCodexPlanType(map[string]any{
+		"plan_type": "plus",
+		"id_token":  staleFreeJWT,
+	})
+	if got != "plus" {
+		t.Fatalf("plan_type = %q, want plus from file metadata", got)
+	}
+
+	got = resolveCodexPlanType(map[string]any{
+		"chatgpt_plan_type": "plus",
+		"id_token":          staleFreeJWT,
+	})
+	if got != "plus" {
+		t.Fatalf("chatgpt_plan_type = %q, want plus from file metadata", got)
+	}
+
+	got = resolveCodexPlanType(map[string]any{
+		"id_token": staleFreeJWT,
+	})
+	if got != "free" {
+		t.Fatalf("jwt fallback = %q, want free", got)
+	}
+}
+
+func TestFileSynthesizer_Synthesize_CodexUsesFilePlanType(t *testing.T) {
+	tempDir := t.TempDir()
+	authData := map[string]any{
+		"type":       "codex",
+		"email":      "plus@example.com",
+		"plan_type":  "plus",
+		"id_token":   fakeCodexIDToken(t, "free"),
+		"access_token": "access",
+		"refresh_token": "refresh",
+	}
+	raw, err := json.Marshal(authData)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err = os.WriteFile(filepath.Join(tempDir, "plus.json"), raw, 0o600); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+
+	auths, err := NewFileSynthesizer().Synthesize(&SynthesisContext{
+		Config:      &config.Config{},
+		AuthDir:     tempDir,
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil {
+		t.Fatalf("synthesize: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("auths = %d, want 1", len(auths))
+	}
+	if got := auths[0].Attributes["plan_type"]; got != "plus" {
+		t.Fatalf("attributes plan_type = %q, want plus", got)
+	}
+}
+
+func fakeCodexIDToken(t *testing.T, planType string) string {
+	t.Helper()
+	header := base64URLEncodeJSON(map[string]any{"alg": "none", "typ": "JWT"})
+	payload := base64URLEncodeJSON(map[string]any{
+		"email": "plus@example.com",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_plan_type": planType,
+		},
+	})
+	return header + "." + payload + ".sig"
+}
+
+func base64URLEncodeJSON(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return strings.TrimRight(base64.RawURLEncoding.EncodeToString(raw), "=")
 }
