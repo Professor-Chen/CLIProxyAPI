@@ -1562,7 +1562,7 @@ func (s *Server) Start() error {
 		log.Debugf("Starting API server on %s", addr)
 	}
 
-	if errVirtualPools := s.startVirtualPoolListeners(s.server.TLSConfig); errVirtualPools != nil {
+	if errVirtualPools := s.startVirtualPoolListeners(s.resolveVirtualPoolTLSConfig()); errVirtualPools != nil {
 		if errClose := listener.Close(); errClose != nil {
 			log.Debugf("failed to close main listener after virtual pool listener failure: %v", errClose)
 		}
@@ -1631,6 +1631,25 @@ func (s *Server) startVirtualPoolListeners(tlsConfig *tls.Config) error {
 	return s.startVirtualPoolListenersLocked(tlsConfig)
 }
 
+// resolveVirtualPoolTLSConfig returns the TLS config virtual-pool listeners
+// should inherit from the main server. When tls.enable is false, this MUST
+// return nil — reloads historically passed s.server.TLSConfig which can be a
+// non-nil empty *tls.Config (e.g. after http2.ConfigureServer), wrapping
+// pool ports in "tls: no certificates configured" sockets that reject plain
+// HTTP with "Client sent an HTTP request to an HTTPS server".
+func (s *Server) resolveVirtualPoolTLSConfig() *tls.Config {
+	if s == nil || s.cfg == nil || !s.cfg.TLS.Enable {
+		return nil
+	}
+	if s.server == nil || s.server.TLSConfig == nil {
+		return nil
+	}
+	if len(s.server.TLSConfig.Certificates) == 0 && s.server.TLSConfig.GetCertificate == nil {
+		return nil
+	}
+	return s.server.TLSConfig
+}
+
 func (s *Server) startVirtualPoolListenersLocked(tlsConfig *tls.Config) error {
 	listeners, errNormalize := s.normalizedVirtualPoolListeners()
 	if errNormalize != nil {
@@ -1639,6 +1658,12 @@ func (s *Server) startVirtualPoolListenersLocked(tlsConfig *tls.Config) error {
 	if len(listeners) == 0 {
 		return nil
 	}
+
+	// Never wrap pool ports in TLS unless the operator explicitly enabled TLS
+	// AND we have a usable certificate config. An empty *tls.Config still
+	// creates a TLS listener that cannot complete handshakes.
+	useTLS := s.cfg != nil && s.cfg.TLS.Enable && tlsConfig != nil &&
+		(len(tlsConfig.Certificates) > 0 || tlsConfig.GetCertificate != nil)
 
 	for _, listenerCfg := range listeners {
 		addr := fmt.Sprintf("%s:%d", listenerCfg.Host, listenerCfg.Port)
@@ -1652,7 +1677,7 @@ func (s *Server) startVirtualPoolListenersLocked(tlsConfig *tls.Config) error {
 			Addr:    addr,
 			Handler: s.virtualPoolHTTPHandler(listenerCfg.Prefix),
 		}
-		if tlsConfig != nil {
+		if useTLS {
 			server.TLSConfig = tlsConfig.Clone()
 			if errHTTP2 := http2.ConfigureServer(server, &http2.Server{}); errHTTP2 != nil {
 				log.Warnf("failed to configure HTTP/2 for virtual pool listener %q: %v", listenerCfg.Name, errHTTP2)
@@ -1719,8 +1744,187 @@ func (s *Server) virtualPoolHTTPHandler(prefix string) http.Handler {
 			return
 		}
 		rewriteVirtualPoolRequestModel(r, prefix)
+		if prefix != "" && isVirtualPoolModelsListPath(r) {
+			capture := &virtualPoolModelsCapture{ResponseWriter: w, prefix: prefix}
+			s.engine.ServeHTTP(capture, r)
+			capture.flush()
+			return
+		}
 		s.engine.ServeHTTP(w, r)
 	})
+}
+
+// isVirtualPoolModelsListPath reports whether this request is a model-catalog
+// GET that should be scoped to the virtual-pool prefix. Pool ports rewrite
+// POST bodies to prefix/model, but historically listed the shared registry
+// (bare + every pool's prefixed aliases). Admin "fetch models" then showed
+// plus/k12 clutter on a Plus-only channel.
+func isVirtualPoolModelsListPath(r *http.Request) bool {
+	if r == nil || r.Method != http.MethodGet {
+		return false
+	}
+	path := strings.TrimSuffix(strings.TrimSpace(r.URL.Path), "/")
+	switch path {
+	case "/v1/models", "/openai/v1/models", "/v1beta/models", "/v1beta/openai/models":
+		return true
+	default:
+		return false
+	}
+}
+
+// virtualPoolModelsCapture buffers a models-list response so we can rewrite
+// it to bare IDs that belong to this pool only.
+type virtualPoolModelsCapture struct {
+	http.ResponseWriter
+	prefix     string
+	statusCode int
+	buf        bytes.Buffer
+	wroteHeader bool
+}
+
+func (c *virtualPoolModelsCapture) WriteHeader(statusCode int) {
+	if c.wroteHeader {
+		return
+	}
+	c.statusCode = statusCode
+	c.wroteHeader = true
+}
+
+func (c *virtualPoolModelsCapture) Write(b []byte) (int, error) {
+	if !c.wroteHeader {
+		c.WriteHeader(http.StatusOK)
+	}
+	return c.buf.Write(b)
+}
+
+func (c *virtualPoolModelsCapture) flush() {
+	status := c.statusCode
+	if status == 0 {
+		status = http.StatusOK
+	}
+	body := c.buf.Bytes()
+	if status >= 200 && status < 300 && len(body) > 0 {
+		if filtered, ok := filterVirtualPoolModelsResponse(body, c.prefix); ok {
+			body = filtered
+			c.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		}
+	}
+	c.ResponseWriter.WriteHeader(status)
+	_, _ = c.ResponseWriter.Write(body)
+}
+
+// filterVirtualPoolModelsResponse keeps only models owned by this pool and
+// rewrites their IDs to bare names (port already implies the prefix via
+// rewriteVirtualPoolRequestModel on POSTs).
+//
+// Ownership rule: prefer prefix/name aliases (e.g. plus/gpt-5.5). Bare IDs
+// that also exist as prefix/name are covered by the alias rewrite. Bare IDs
+// with no matching prefix alias are dropped (they usually come from other
+// pools when force-model-prefix is false).
+func filterVirtualPoolModelsResponse(body []byte, prefix string) ([]byte, bool) {
+	prefix = strings.Trim(strings.TrimSpace(prefix), "/")
+	if prefix == "" || len(body) == 0 {
+		return body, false
+	}
+	needle := prefix + "/"
+
+	dataResult := gjson.GetBytes(body, "data")
+	if dataResult.IsArray() {
+		filtered := make([]any, 0, len(dataResult.Array()))
+		seen := make(map[string]struct{}, len(dataResult.Array()))
+		for _, item := range dataResult.Array() {
+			id := strings.TrimSpace(item.Get("id").String())
+			if id == "" {
+				id = strings.TrimSpace(item.Get("name").String())
+			}
+			bare, ok := virtualPoolBareModelID(id, needle)
+			if !ok {
+				continue
+			}
+			if _, exists := seen[bare]; exists {
+				continue
+			}
+			seen[bare] = struct{}{}
+			obj := item.Value()
+			m, isMap := obj.(map[string]any)
+			if !isMap {
+				continue
+			}
+			clone := make(map[string]any, len(m))
+			for k, v := range m {
+				clone[k] = v
+			}
+			if _, hasID := clone["id"]; hasID {
+				clone["id"] = bare
+			}
+			if _, hasName := clone["name"]; hasName {
+				clone["name"] = bare
+			}
+			filtered = append(filtered, clone)
+		}
+		out, err := sjson.SetBytes(body, "data", filtered)
+		if err != nil {
+			return body, false
+		}
+		return out, true
+	}
+
+	// Gemini-style: { "models": [ { "name": "models/xxx" }, ... ] }
+	modelsResult := gjson.GetBytes(body, "models")
+	if modelsResult.IsArray() {
+		filtered := make([]any, 0, len(modelsResult.Array()))
+		seen := make(map[string]struct{}, len(modelsResult.Array()))
+		for _, item := range modelsResult.Array() {
+			name := strings.TrimSpace(item.Get("name").String())
+			id := strings.TrimPrefix(name, "models/")
+			bare, ok := virtualPoolBareModelID(id, needle)
+			if !ok {
+				continue
+			}
+			if _, exists := seen[bare]; exists {
+				continue
+			}
+			seen[bare] = struct{}{}
+			obj := item.Value()
+			m, isMap := obj.(map[string]any)
+			if !isMap {
+				continue
+			}
+			clone := make(map[string]any, len(m))
+			for k, v := range m {
+				clone[k] = v
+			}
+			if strings.HasPrefix(name, "models/") {
+				clone["name"] = "models/" + bare
+			} else {
+				clone["name"] = bare
+			}
+			filtered = append(filtered, clone)
+		}
+		out, err := sjson.SetBytes(body, "models", filtered)
+		if err != nil {
+			return body, false
+		}
+		return out, true
+	}
+
+	return body, false
+}
+
+func virtualPoolBareModelID(id, needle string) (string, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", false
+	}
+	if strings.HasPrefix(id, needle) {
+		bare := strings.TrimSpace(strings.TrimPrefix(id, needle))
+		if bare == "" || strings.Contains(bare, "/") {
+			return "", false
+		}
+		return bare, true
+	}
+	// Bare IDs are ambiguous across pools; only prefixed aliases are kept.
+	return "", false
 }
 
 func isVirtualPoolManagementPath(path string) bool {
@@ -1829,7 +2033,10 @@ func (s *Server) reloadVirtualPoolListenersIfNeeded(oldCfg, newCfg *config.Confi
 	s.virtualPoolMu.Lock()
 	defer s.virtualPoolMu.Unlock()
 	s.closeVirtualPoolServersLocked()
-	if err := s.startVirtualPoolListenersLocked(s.server.TLSConfig); err != nil {
+	// Resolve TLS from cfg.TLS.Enable (+ usable certs), never raw
+	// s.server.TLSConfig alone — an empty *tls.Config still creates TLS
+	// sockets and breaks plain-HTTP front doors after listener reload.
+	if err := s.startVirtualPoolListenersLocked(s.resolveVirtualPoolTLSConfig()); err != nil {
 		log.Errorf("failed to reload virtual pool listeners: %v", err)
 	}
 }

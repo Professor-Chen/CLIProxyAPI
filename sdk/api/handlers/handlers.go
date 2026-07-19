@@ -629,8 +629,12 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 }
 
-// StartNonStreamingKeepAlive emits blank lines every 5 seconds while waiting for a non-streaming response.
+// StartNonStreamingKeepAlive emits blank lines while waiting for a non-streaming response.
 // It returns a stop function that must be called before writing the final response.
+//
+// When enabled, it immediately writes HTTP 200 headers and flushes so clients with a
+// response-header timeout (e.g. net/http ResponseHeaderTimeout) do not hang until the
+// full JSON body is ready. Subsequent blank lines are JSON-safe leading whitespace.
 func (h *BaseAPIHandler) StartNonStreamingKeepAlive(c *gin.Context, ctx context.Context) func() {
 	if h == nil || c == nil {
 		return func() {}
@@ -645,6 +649,16 @@ func (h *BaseAPIHandler) StartNonStreamingKeepAlive(c *gin.Context, ctx context.
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+
+	// Commit headers immediately. Leading whitespace is valid before a JSON body.
+	if !c.Writer.Written() {
+		if c.Writer.Header().Get("Content-Type") == "" {
+			c.Header("Content-Type", "application/json")
+		}
+		c.Status(http.StatusOK)
+		_, _ = c.Writer.Write([]byte("\n"))
+		flusher.Flush()
 	}
 
 	stopChan := make(chan struct{})
